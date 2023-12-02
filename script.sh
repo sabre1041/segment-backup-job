@@ -25,7 +25,26 @@ check_thanos_querier_status() {
     return 1
 }
 
-check_pull_secret() {
+check_user_workload_monitoring_enabled() {
+  uwm_namespace_exists=$(oc get openshift-user-workload-monitoring --ignore-not-found=true) 
+  if [[ -z $uwm_namespace_exists]]; then
+    echo "Error, project \"openshift-user-workload-monitoring\" does not exist."
+    exit 1
+  fi
+  PROM_TOKEN_SECRET_NAME=$(oc get secret -n openshift-user-workload-monitoring | grep  prometheus-user-workload-token | head -n 1 | awk '{print $1 }')
+  if [[ -z $PROM_TOKEN_SECRET_NAME ]]; then 
+    echo "Error, could not find a secret for the \"prometheus-user-workload-token\" in namespace \"openshift-user-workload-monitoring\"."
+    exit 1
+  fi
+  PROM_TOKEN_SECRET_TOKEN=$(oc get secret $PROM_TOKEN_SECRET_NAME -n openshift-user-workload-monitoring -o json | jq -r '.data.token')
+  if [[ -z $PROM_TOKEN_SECRET_TOKEN || $PROM_TOKEN_SECRET_TOKEN == "null" ]]; then
+    echo "Error, could not get token data for the secret for the \"prometheus-user-workload-token\" in namespace \"openshift-user-workload-monitoring\"."
+    exit 1
+  fi
+  exit 0
+}
+
+check_pull_secret_exists() {
     local attempts=0
 
     while [[ $attempts -lt $max_attempts ]]; do
@@ -46,17 +65,19 @@ check_pull_secret() {
     return 1
 }
 
-check_pull_secret
+check_pull_secret_data() {
+  pull_secret_userID=$(oc get secret pull-secret -n sigstore-monitoring -o "jsonpath={.data.pull-secret\.json}" | jq .userId)
+  if [[ $pull_secret_userID == "null" ]]; then
+    echo "Error, you are using default openshift pull-secret, cannot send data. 
+    If you want to send metrics please download the pull-secret from \`https://console.redhat.com/application-services/trusted-content/artifact-signer\`.
+    Then create the secret \"pull-secret\" in namespace \"sigstore-monitoring\" from the value:  \`oc create secret generic pull-secret -n sigstore-monitoring --from-file=\$HOME/Downloads/pull-secret.json\`
+    "
+    exit 1
+}
+
+check_pull_secret_exists
+check_pull_secret_data
 check_thanos_querier_status
-
-pull_secret_exists=$(oc get secret  pull-secret -n sigstore-monitoring --ignore-not-found=true)
-
-if [[ -z $pull_secret_exists ]]; then
-    echo "Error, Secret \`pull-secret\` does not exist in nampesace \`sigstore-monitoring\`.
-    Please download the pull-secret from \`https://console.redhat.com/application-services/trusted-content/artifact-signer\`
-    and create a secret from it: \`oc create secret generic pull-secret -n sigstore-monitoring --from-file=\$HOME/Downloads/pull-secret.json\`. "
-    exit 0
-fi
 
 secret_data=$(oc get secret pull-secret -n sigstore-monitoring -o "jsonpath={.data.pull-secret\.json}")
 registry_auth=$(echo $secret_data | base64 -d | jq .auths."\"registry.redhat.io\"".auth | cut -d "\"" -f 2 | base64 -d)
@@ -83,10 +104,6 @@ user_id=$(echo $secret_data | base64 -d  | jq ".userId" | cut -d "\"" -f 2 )
 alg_id=$(echo ${registry_auth:$registry_user_id_index+1:(${base64_indexes[0]}-($registry_user_id_index+1))} | base64 -d | jq .alg | cut -d "\"" -f 2 )
 sub_id=$(echo ${registry_auth:(${base64_indexes[0]}+1):(${base64_indexes[1]}-${base64_indexes[0]}-1)} | base64 -d | jq .sub |  cut -d "\"" -f 2)
 
-PROM_TOKEN_SECRET_NAME=$(oc get secret -n openshift-user-workload-monitoring | grep  prometheus-user-workload-token | head -n 1 | awk '{print $1 }')
-PROM_TOKEN_DATA=$(echo $(oc get secret $PROM_TOKEN_SECRET_NAME -n openshift-user-workload-monitoring -o json | jq -r '.data.token') | base64 -d)
-THANOS_QUERIER_HOST=$(oc get route thanos-querier -n openshift-monitoring -o json | jq -r '.spec.host')
-
 echo "org_id: $org_id" > /opt/app-root/src/tmp
 echo "user_id: $user_id" >> /opt/app-root/src/tmp
 # echo "registry_org_id: $registry_org_id" > /opt/app-root/src/tmp
@@ -95,6 +112,12 @@ echo "alg_id: $alg_id" >> /opt/app-root/src/tmp
 echo "sub_id: $sub_id" >> /opt/app-root/src/tmp
 
 if [[ $RUN_TYPE == "nightly" ]]; then
+  check_user_workload_monitoring_enabled
+  
+  PROM_TOKEN_SECRET_NAME=$(oc get secret -n openshift-user-workload-monitoring | grep  prometheus-user-workload-token | head -n 1 | awk '{print $1 }')
+  PROM_TOKEN_DATA=$(echo $(oc get secret $PROM_TOKEN_SECRET_NAME -n openshift-user-workload-monitoring -o json | jq -r '.data.token') | base64 -d)
+  THANOS_QUERIER_HOST=$(oc get route thanos-querier -n openshift-monitoring -o json | jq -r '.spec.host')
+
   fulcio_new_certs=$(curl -X GET -kG "https://$THANOS_QUERIER_HOST/api/v1/query?" --data-urlencode "query=fulcio_new_certs" -H "Authorization: Bearer $PROM_TOKEN_DATA" | jq '.data.result[] | .value[1]')
 
   rekor_new_entries_query_data=$(curl -X GET -kG "https://$THANOS_QUERIER_HOST/api/v1/query?" --data-urlencode "query=rekor_new_entries" -H "Authorization: Bearer $PROM_TOKEN_DATA" | jq '.data.result[]' )
